@@ -31,34 +31,42 @@ func Update(dir string, updatedFiles map[string]struct{}) error {
 		return nil
 	}
 	log.Logger.Debugf("NVD updated files: %d", len(targets))
+	log.Logger.Debug("NVD batch update")
 
 	bar := utils.PbStartNew(len(targets))
 	defer bar.Finish()
-	var items []Item
-	err = utils.FileWalk(rootDir, targets, func(r io.Reader, _ string) error {
-		item := Item{}
-		if err := json.NewDecoder(r).Decode(&item); err != nil {
-			return xerrors.Errorf("failed to decode NVD JSON: %w", err)
+
+	items := make(chan Item, 100)
+	errCh := make(chan error)
+	go func() {
+		defer close(items)
+		defer close(errCh)
+		err = utils.FileWalk(rootDir, targets, func(r io.Reader, _ string) error {
+			item := Item{}
+			if err := json.NewDecoder(r).Decode(&item); err != nil {
+				return xerrors.Errorf("failed to decode NVD JSON: %w", err)
+			}
+			items <- item
+			bar.Increment()
+			return nil
+		})
+		if err != nil {
+			errCh <- xerrors.Errorf("error in NVD walk: %w", err)
 		}
-		items = append(items, item)
-		bar.Increment()
-		return nil
-	})
-	if err != nil {
-		return xerrors.Errorf("error in NVD walk: %w", err)
-	}
+	}()
 
 	if err = save(items); err != nil {
 		return xerrors.Errorf("error in NVD save: %w", err)
 	}
-
+	if err := <-errCh; err != nil {
+		return err
+	}
 	return nil
 }
 
-func save(items []Item) error {
-	log.Logger.Debug("NVD batch update")
+func save(items chan <-Item) error {
 	err := vulnerability.BatchUpdate(func(b *bolt.Bucket) error {
-		for _, item := range items {
+		for item := range items {
 			cveID := item.Cve.Meta.ID
 			severity, _ := vulnerability.NewSeverity(item.Impact.BaseMetricV2.Severity)
 			severityV3, _ := vulnerability.NewSeverity(item.Impact.BaseMetricV3.CvssV3.BaseSeverity)
